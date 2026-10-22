@@ -258,6 +258,189 @@ analytics view, which doesn't exist. Still shows SCOPE in the nav for that reaso
 
 ---
 
+## Phase 5 — Separation (19 Oct, new requirement — not started)
+
+New requirement from the user, verbatim: *"maintain separate database, url, be for
+admin panel dont mix it with user's data."*
+
+This **reverses the design doc's own architecture decision** (#architecture: "A second
+door into the same services… The console does not need a new backend"). Recorded here
+because the doc is now wrong on this point and anyone reading it should know the
+requirement superseded it.
+
+### Decision (19 Oct)
+
+Separate admin backend (new repo `simplelifepack/admin-backend`), separate `admin_db`,
+separate URL. The admin BE holds **two** connections:
+
+- `admin_db` — full access, its own Prisma schema + migrations
+- `user_db` — a **restricted Postgres role** with column-level `GRANT`s: `SELECT` only on
+  non-sealed columns, `UPDATE` only on the handful of columns admin actions legitimately
+  write. The sealed-data boundary stops being code discipline and becomes a database
+  permission — which is what the design doc itself flagged as the weak point ("enforced by
+  code and audit, not by cryptography").
+
+The user BE is unchanged: still exactly one connection, to `user_db`.
+
+Two alternatives were considered and rejected:
+- **API-mediated** (admin BE has no user_db access at all; everything through an internal
+  API on the user BE). Strictest, and the better long-term shape, but ~75 read sites + ~12
+  write sites become API calls plus a new internal API to build, version and secure. The
+  chosen design is incrementally upgradeable to this later by swapping the second Prisma
+  client for an API client.
+- **Separate BE + URL, shared DB.** Cheapest, keeps `withAudit()` atomic, but does not
+  satisfy "separate database" — rejected knowingly, not overlooked.
+
+### Which tables move
+
+The principle that resolves nearly every case: **the user BE keeps exactly one connection,
+so any table it touches at runtime must stay in `user_db`.** Verified by grep, not assumed —
+`UserLimitOverride` is read by quota enforcement, `Feedback` by the submission endpoint,
+`SignInEvent` on login, `EmailLog` on every send, `AITaskConfig` on every live AI call.
+
+**→ `admin_db`:** `AdminUser`, `AdminPasskey`, `AdminWebAuthnChallenge`, `AdminSession`,
+`AdminAuditLog`, `PromptRevision`, `Job`, `RateLimitHit`, `SystemSetting`, `AlertRule`,
+`AlertChannel`, `AIBudget`.
+
+**→ stays in `user_db`:** all 40 user-data models, plus `UserLimitOverride`, `Feedback`,
+`SignInEvent`, `EmailLog`, `AITaskConfig`, `AIRequestLog`.
+
+`AlertRule`/`AlertChannel`/`AIBudget` only qualify to move because of the second decision
+below; without it they'd be pinned to `user_db`.
+
+### Consequences accepted
+
+1. **`withAudit()` loses atomicity for cross-DB writes.** It currently writes the audit row
+   in the *same* `prisma.$transaction` as the change (decision D4). With `AdminAuditLog` in
+   `admin_db` and `User` in `user_db` that's a distributed transaction Postgres won't give
+   us. Plan: an outbox — write the audit row to `admin_db` as `pending` **before** the
+   user-DB write, mark it `committed` after, and have a reconciler flag anything stuck
+   `pending`. This fails in the safe direction (phantom audit rows for writes that didn't
+   land, never a write with no audit row), so "every write is audited" survives. Affects
+   only the ~12 cross-DB write sites, enumerated below.
+2. **Cross-DB foreign keys die.** `AdminAuditLog.adminId` is fine (admin-local), but any FK
+   crossing the boundary becomes a plain ID column with no referential integrity. The
+   deliberate `onDelete: SetNull` guarantees on those relations go away and have to be
+   re-established in application code.
+3. **Budget alerting becomes periodic, not immediate.** Decided 19 Oct: the user BE stops
+   evaluating budgets inside live AI calls (it only writes `AIRequestLog`); the admin BE
+   evaluates on a schedule. This is what frees `AIBudget`/`AlertRule`/`AlertChannel` to move.
+
+### The ~12 cross-DB write sites (need the outbox treatment)
+
+`adminUsers.service.ts` — tier change, suspend, unsuspend, cancel deletion (4× `user.update`),
+force sign-out + suspend session revocation (2× `refreshToken.updateMany`) ·
+`adminUsage.service.ts` — override grant/revoke/supersede (3×) ·
+`adminTrust.service.ts` — revoke on behalf (1×) ·
+`adminIntegrations.service.ts` — force disconnect (1×) ·
+`jobs/rewrapJob.service.ts` — `document.update` per rewrapped key ·
+`adminPackages.service.ts` — legacy `user.upsert` (check whether still needed)
+
+### Sequencing
+
+1. Land PR #1 (`admin-console-backend`) first — known-good checkpoint before the refactor.
+2. In the existing backend repo: move budget evaluation out of the live AI path; add the
+   restricted `user_db` role + `GRANT`s as a migration.
+3. New `simplelifepack/admin-backend` repo: admin Prisma schema + migrations for the 12
+   tables above, two Prisma clients, port the admin routes/services across.
+4. Outbox for the cross-DB writes + reconciler.
+5. Point `admin-web` at the new admin BE URL (`VITE_ADMIN_API_URL`).
+6. Re-run `test:admin-dto-allowlist` against the new topology — the restricted role should
+   make several of its assertions true by construction rather than by DTO discipline.
+
+**Blocked on:** `simplelifepack/admin-backend` doesn't exist yet. Needs creating on the
+`simplelifepack` account with collaborator access, same as `admin-web` on 15 Oct.
+
+## Merging with main's privacy/encryption work (21-22 Oct)
+
+PR #1 (`admin-console-backend` → `main`) sat open since 15 Oct. By 21 Oct, `main` had
+moved significantly — Ranjith's "Encrypt private user records and remove standalone
+extraction pipelines" (16 Oct, 176 files, +6178/-4148) added field-level encryption
+(`src/privacy/`) across most of the schema and deleted the legacy ingestion pipeline.
+GitHub reported the PR as `CONFLICTING`. User confirmed proceeding with the merge.
+
+### Conflict resolution (git-level) — done, verified correct
+
+8 files conflicted: `package.json`, `package-lock.json`, `prisma/schema.prisma` (7 hunks —
+6 were pure whitespace-realignment noise resolved by keeping main's `private_*` field
+additions; the 7th, the `User` model, combined both sides' additions),
+`src/scripts/backfillPackageSources.ts`, `src/services/auth.service.ts` (3 hunks — our
+`suspendedAt` check + `recordSignIn` call re-threaded into main's `withPrivateUser`/
+`authenticatedUser` refactor, including fixing a since-unreachable code path after main's
+`return result` inside the retry loop), `src/services/documentAnalyzer/openaiDocumentAnalyzer.ts`
+(main fully rewrote this — single structured-output call replacing two-stage
+classify-then-extract, byte-zeroing after use; our `getTaskConfig`/`recordAIRequest`
+wiring rebuilt on top of main's structure, not the old one), `src/services/health.service.ts`,
+`src/services/healthExtraction.service.ts` (same pattern — main moved the prompt to
+`healthExtractionPrompt.ts` and switched to multi-file input; our AI-config wiring rebuilt
+on top).
+
+Verified: no real SQL-level migration collision (checked every `ALTER TABLE` on both
+sides — only `User` is shared, and the two migration sets touch entirely different
+columns). `tsc` clean. Main's own `test:document-ai` suite (9 tests, including their new
+health-extraction tests) passes unmodified against the resolution. `prisma validate` clean.
+Regenerated `package-lock.json` rather than hand-merging it.
+
+Two narrow, confirmed pre-existing bugs found and fixed along the way (not introduced by
+this merge — both reproduced against unmodified `origin/main` code):
+- `src/services/googleAuth.test.ts` and this project's own
+  `src/routes/admin/dtoAllowlist.contract.test.ts` both predate main's encryption work and
+  create fixtures via raw `prisma.*.create()` with no privacy access context. Fixed by
+  wrapping in `withPrivateMigration(...)`, main's own sanctioned pattern (see
+  `src/privacy/modules.integration.test.ts`). `googleAuth.test.ts`'s own **race-scenario**
+  sub-test still fails separately — root-caused to Node's `AsyncLocalStorage` context not
+  surviving Prisma's internal transaction retry on serialization conflict
+  (`isolationLevel: "Serializable"`); reproduced on unmodified main code via a disposable
+  git worktree. Out of scope to fix blind in privacy infrastructure I don't own — flagged
+  for Ranjith, not fixed.
+- `/admin/v1/overview/action-center` 500'd unconditionally (reproduced on a clean DB, zero
+  records — unrelated to any admin console data). Root cause: `.aggregate()`/`.groupBy()`
+  is forbidden outright on any encrypted model, even when the predicate only touches
+  operational/allowlisted fields. Fixed for real (not a stopgap) for the 3 metrics whose
+  predicates are fully operational (`Document`-based) by converting to `.count()` +
+  `.findFirst()`. The other 3 metrics (`ReadinessPack`, `HealthDocument`,
+  `ExternalConnection` — predicates touch genuinely-encrypted fields) degrade gracefully
+  (0, logged) instead of 500ing the page; see `countOldest()` in `overview.routes.ts` for
+  the full writeup.
+
+### Confirmed architectural gaps — NOT fixed, need design work from Ranjith
+
+Investigated three findings deeply enough to write precise questions, sent them to
+Ranjith, got answers back (22 Oct):
+
+1. **No admin-access mode exists in the privacy layer at all.** `src/privacy/access.ts`
+   has exactly 4 access contexts: `user` (self-only), `migration`/`maintenance` (bypass
+   ownership unconditionally, meant for offline backfills), `credential` (restricted
+   lookup only). None fit "an authenticated admin reading another user's protected field
+   for support/ops, scoped and audited." Confirmed via `/admin/v1/users`: its `select`
+   includes `name`/`email` (both protected, not on `operationalFields.User`'s allowlist),
+   and throws `Private record not found` unconditionally — **every admin screen that shows
+   a user's name or email is broken against the real encrypted database.**
+   **Ranjith's answer: "no one can view user details, but yes, this should be
+   implemented."** Confirms this is a real, pre-existing, system-wide gap — not something
+   the admin console broke, and not something to engineer around unilaterally (using
+   `withPrivateMigration` as a workaround would route around the exact check the whole
+   encryption effort exists to enforce). **This blocks every admin screen depending on
+   it until a real admin-access mode is designed and built** — tracked here, not solved.
+2. **`.aggregate()`/`.groupBy()` forbidden on encrypted models.** Confirmed not permanent.
+   **Ranjith's answer: "This is not permanent. the fields are encrypted, we need to think
+   about how to handle this going forward."** The `.count()`+`.findFirst()` conversion in
+   `overview.routes.ts` is a working interim measure, not the final answer — may need
+   revisiting once a real aggregation path exists.
+3. **`ReadinessPack.verificationStatus`/`lastCheckedAt` encrypted for AI-generated (not
+   `createdBy: "seed"`) packs** — the catalogue review flow (approve/reject a
+   pending-review pack) likely can't read its own review-status fields today.
+   **Ranjith's answer: "This is a gap that needs to be fixed."** Confirmed open, not
+   investigated further here (out of scope for this merge — the admin console's
+   `/admin/v1/catalogue/review-queue` route wasn't touched by this PR).
+
+### Decision
+
+Push the merge as-is. The conflict-resolution work is sound and shouldn't be held hostage
+to a separate, larger, now-tracked architecture gap. Admin screens reading protected user
+fields will not work in production against the real encrypted DB until gap #1 above is
+designed and built — this is now a known, documented limitation, not a silent regression.
+
 ## Environment (local dev, this machine)
 
 - Node v26.11.1, PostgreSQL 16 — installed via Homebrew, not present before 11 Oct
